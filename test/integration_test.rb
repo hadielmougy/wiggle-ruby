@@ -10,10 +10,11 @@ class IntegrationTest < Minitest::Test
   include Wiggle
 
   URL = ENV.fetch("WIGGLE_TEST_URL", nil)
+  OPTIONS = WorkerOptions.defaults.with_concurrency(2).with_long_poll_wait(1)
 
   def setup
     skip "set WIGGLE_TEST_URL to run integration tests" unless URL
-    @client = Client.new(URL)
+    @client = WiggleClient.new(URL)
   end
 
   def teardown
@@ -22,215 +23,237 @@ class IntegrationTest < Minitest::Test
 
   def unique(prefix) = "#{prefix}-#{Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond)}"
 
-  def new_worker(id) = Worker.new(@client, id, concurrency: 2, long_poll_wait: 1)
-
-  def run_flow(flow, worker, context, timeout: 30)
-    @client.register(flow)
-    worker.start { @client.await_completion(@client.start(flow, context), timeout: timeout) }
+  # Registers +spec+, serves it with +handlers+, starts one instance and waits for it.
+  def run_flow(spec, handlers, context, timeout = 30)
+    @client.register(spec)
+    worker = Worker.new(@client, "it-#{spec.name}", OPTIONS).register_handler(spec.name, handlers).start
+    begin
+      @client.await_completion(@client.start(spec, context), timeout)
+    ensure
+      worker.close
+    end
   end
 
-  def test_linear_flow_with_gate
+  def test_linear_flow_with_filter
     name = unique("rb-it-order")
-    flow = Wiggle.workflow(name) do
-      step "validate"
-      gate "in-stock"
-      step "charge", queue: "#{name}-payments"
+    spec = FlowSpec.define(name, 1) do |f|
+      f.then_apply(:validate).then_filter(:in_stock?).then_apply(:charge, "#{name}-payments")
     end
-    w = new_worker("it-order")
-        .handle(name, "validate") { |c| c.merge("status" => "VALIDATED") }
-        .handle_gate(name, "in-stock") { |c| c["qty"].positive? }
-        .handle(name, "charge") { |c| c.merge("paymentRef" => "auth-#{c['orderId']}") }
-    @client.register(flow)
-    w.start do
-      ok = @client.await_completion(@client.start(flow, { "orderId" => "x1", "qty" => 1 }))
+    handlers = Class.new do
+      def validate(c) = c.merge("status" => "VALIDATED")
+      def in_stock?(c) = c["qty"].positive?
+      def charge(c) = c.merge("paymentRef" => "auth-#{c['orderId']}")
+    end.new
+    @client.register(spec)
+    worker = Worker.new(@client, "it-order", OPTIONS).register_handler(name, handlers).start
+    begin
+      ok = @client.await_completion(@client.start(spec, { "orderId" => "x1", "qty" => 1 }), 30)
       assert_equal "COMPLETED", ok.status, ok.error
       assert_equal({ "orderId" => "x1", "qty" => 1, "status" => "VALIDATED", "paymentRef" => "auth-x1" }, ok.context)
-      gated = @client.await_completion(@client.start(flow, { "orderId" => "x2", "qty" => 0 }))
-      assert_equal %w[COMPLETED gated:in-stock], [gated.status, gated.termination_reason]
+      gated = @client.await_completion(@client.start(spec, { "orderId" => "x2", "qty" => 0 }), 30)
+      assert_equal %w[COMPLETED gated:in_stock], [gated.status, gated.termination_reason]
+    ensure
+      worker.close
     end
   end
 
-  def test_fork_combine
-    name = unique("rb-it-fork")
-    flow = Graph.new(name, [Fork.new([Branch.new("left", [Step.new("l")]), Branch.new("right", [Step.new("r")])],
-                                     combine: "join")]).compile
-    base_seen = nil
-    w = new_worker("it-fork")
-        .handle(name, "l") { |c| c.merge("side" => "L") }
-        .handle(name, "r") { |c| c.merge("side" => "R") }
-        .handle_combine(name, "join") do |c|
-          base_seen = Current.base
-          { "n" => c["n"], "sides" => c["left"]["side"] + c["right"]["side"] }
-        end
-    v = run_flow(flow, w, { "n" => 1 })
+  def test_all_of_combine
+    spec = FlowSpec.define(unique("rb-it-fork"), 1) do |f|
+      Wiggle.all_of(f.then_apply(:left), f.then_apply(:right)).combine(:join)
+    end
+    seen_base = Queue.new
+    handlers = Class.new do
+      def left(c) = c.merge("side" => "L")
+      def right(c) = c.merge("side" => "R")
+      define_method(:join) do |l, r, base|
+        seen_base << Wiggle::Step.base
+        { "n" => base["n"], "sides" => l["side"] + r["side"] }
+      end
+    end.new
+    v = run_flow(spec, handlers, { "n" => 1 })
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "n" => 1, "sides" => "LR" }, v.context)
-    assert_equal({ "n" => 1 }, base_seen)
+    assert_equal({ "n" => 1 }, seen_base.pop)
   end
 
   def test_for_each
-    name = unique("rb-it-each")
-    flow = Wiggle.workflow(name) do
-      for_each("doubled", over: "xs", combine: "total") { step "double" }
+    spec = FlowSpec.define(unique("rb-it-each"), 1) do |f|
+      f.then_for_each("xs") { |x| x.then_apply(:double) }.combine(:total)
     end
-    w = new_worker("it-each")
-        .handle(name, "double") { |x| x * Current.base["factor"] }
-        .handle_combine(name, "total") { |c| { "total" => c["doubled"].sum } }
-    v = run_flow(flow, w, { "xs" => [1, 2, 3], "factor" => 2 })
+    handlers = Class.new do
+      def double(x) = x * Wiggle::Step.base["factor"]
+      def total(doubled) = { "total" => doubled.sum }
+    end.new
+    v = run_flow(spec, handlers, { "xs" => [1, 2, 3], "factor" => 2 })
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "total" => 12 }, v.context)
   end
 
-  def test_choose_and_do_while
-    name = unique("rb-it-loop")
-    flow = Wiggle.workflow(name) do
-      do_while("more", max_iterations: 10) { step "inc" }
-      choose do
-        on("big") { step "label-big" }
-        otherwise { step "label-small" }
-      end
+  def test_one_of_and_repeat_while
+    spec = FlowSpec.define(unique("rb-it-loop"), 1) do |f|
+      counted = f.repeat_while(:more?, 10) { |body| body.then_apply(:inc) }
+      Wiggle.one_of(counted.when(:big?).then_apply(:label_big), counted.otherwise.then_apply(:label_small))
     end
-    w = new_worker("it-loop")
-        .handle(name, "inc") { |c| c.merge("i" => c["i"] + 1) }
-        .handle_gate(name, "more") { |c| c["i"] < 4 }
-        .handle_gate(name, "big") { |c| c["i"] > 3 }
-        .handle(name, "label-big") { |c| c.merge("label" => "big") }
-        .handle(name, "label-small") { |c| c.merge("label" => "small") }
-    v = run_flow(flow, w, { "i" => 0 })
+    handlers = Class.new do
+      def inc(c) = c.merge("i" => c["i"] + 1)
+      def more?(c) = c["i"] < 4
+      def big?(c) = c["i"] > 3
+      def label_big(c) = c.merge("label" => "big")
+      def label_small(c) = c.merge("label" => "small")
+    end.new
+    v = run_flow(spec, handlers, { "i" => 0 })
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "i" => 4, "label" => "big" }, v.context)
   end
 
-  def test_signal_and_sleep
-    name = unique("rb-it-signal")
-    flow = Wiggle.workflow(name) do
-      sleep "nap", millis: 100
-      await_signal "approve", timeout: 30
-      step "finish"
-    end
-    @client.register(flow)
-    w = new_worker("it-signal").handle(name, "finish") { |c| c.merge("done" => true) }
-    v = w.start do
-      id = @client.start(flow, {})
+  def test_await_and_sleep
+    spec = FlowSpec.define(unique("rb-it-signal"), 1) { |f| f.then_sleep(0.1).then_await("approve", 30).then_apply(:finish) }
+    @client.register(spec)
+    handlers = Class.new { def finish(c) = c.merge("done" => true) }.new
+    worker = Worker.new(@client, "it-signal", OPTIONS).register_handler(spec.name, handlers).start
+    begin
+      id = @client.start(spec, {})
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
       begin
         @client.signal(id, "approve", { "by" => "ops" })
-      rescue GRPC::BadStatus # not waiting for the signal yet
+      rescue WiggleApiException # not waiting for the signal yet
         raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
 
         Kernel.sleep 0.1
         retry
       end
-      @client.await_completion(id, timeout: 20)
+      v = @client.await_completion(id, 20)
+    ensure
+      worker.close
     end
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "by" => "ops", "done" => true }, v.context)
   end
 
-  def test_sub_workflow
-    child = unique("rb-it-child")
-    parent = unique("rb-it-parent")
-    child_flow = Wiggle.workflow(child) { step "work" }
-    @client.register(child_flow)
-    flow = Wiggle.workflow(parent) do
-      sub_workflow "child", child_flow
-      step "after"
+  def test_sub_flow
+    child = FlowSpec.define(unique("rb-it-child"), 1) { |f| f.then_apply(:work) }
+    @client.register(child)
+    parent = FlowSpec.define(unique("rb-it-parent"), 1) { |f| f.then_sub_flow("child", child).then_apply(:after) }
+    @client.register(parent)
+    worker = Worker.new(@client, "it-sub", OPTIONS)
+                   .register_handler(child.name, Class.new { def work(c) = c.merge("child" => true) }.new)
+                   .register_handler(parent.name, Class.new { def after(c) = c.merge("after" => true) }.new)
+                   .start
+    begin
+      v = @client.await_completion(@client.start(parent, {}), 30)
+    ensure
+      worker.close
     end
-    w = new_worker("it-sub")
-        .handle(child, "work") { |c| c.merge("child" => true) }
-        .handle(parent, "after") { |c| c.merge("after" => true) }
-    v = run_flow(flow, w, {})
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "child" => true, "after" => true }, v.context)
   end
 
+  class Reserve
+    include Wiggle::CompensableActivity
+
+    def initialize(undone) = @undone = undone
+    def execute(c) = { "orderId" => c["orderId"], "reservationRef" => "r-1" }
+    def compensate(comp) = @undone << comp
+  end
+
   def test_compensation
-    name = unique("rb-it-saga")
-    flow = Wiggle.workflow(name) do
-      step "reserve", compensate: true
-      step "overwrite"
-      step "boom"
+    spec = FlowSpec.define(unique("rb-it-saga"), 1) do |f|
+      f.then_apply_compensable(:reserve).then_apply(:overwrite).then_apply(:boom)
     end
     undone = Queue.new
-    w = new_worker("it-saga")
-        .handle(name, "reserve") { |c| { "orderId" => c["orderId"], "reservationRef" => "r-1" } }
-        .handle_compensation(name, "reserve") { |comp| undone << comp }
-        .handle(name, "overwrite") { |_| { "unrelated" => true } }
-        .handle(name, "boom") { |_| raise PermanentError, "downstream exploded" }
-    v = run_flow(flow, w, { "orderId" => "o-9" })
+    handlers = Class.new do
+      define_method(:reserve) { Reserve.new(undone) }
+      def overwrite(_c) = { "unrelated" => true }
+      def boom(_c) = raise(Wiggle::PermanentActivityException, "downstream exploded")
+    end.new
+    v = run_flow(spec, handlers, { "orderId" => "o-9" })
     assert_equal "COMPENSATED", v.status, v.error
     comp = undone.pop
     assert_equal "r-1", comp.result["reservationRef"]
     assert_equal({ "orderId" => "o-9" }, comp.input)
   end
 
-  def test_register_handlers_object
-    name = unique("rb-it-typed")
-    flow = Wiggle.workflow(name) do
-      step "validate"
-      gate "in-stock"
-      effect "notify"
+  module TypedSteps
+    extend Wiggle::ForFlow
+
+    def validate(o) = nil
+    def in_stock?(o) = nil
+    void def notify(o) = nil
+  end
+
+  def test_contract_and_void_effect
+    spec = FlowSpec.define(unique("rb-it-typed"), 1, TypedSteps) do |f, s|
+      f.then_apply(s.validate).then_filter(s.in_stock?).then_accept(s.notify)
     end
     notified = Queue.new
-    handlers = Class.new(Wiggle::Handlers) do
-      define_method(:validate) { |o| o.merge("status" => "VALIDATED") }
-      define_method(:in_stock?) { |o| o["qty"].positive? }
-      define_method(:notify) { |o| notified << o["orderId"] }
-      effect :notify
-    end
-    w = new_worker("it-typed").register_handlers(handlers.new, workflow: name)
-    v = run_flow(flow, w, { "orderId" => "t-1", "qty" => 2 })
+    handlers = Class.new do
+      include TypedSteps
+      def validate(o) = o.merge("status" => "VALIDATED")
+      def in_stock?(o) = o["qty"].positive?
+      define_method(:notify) { |o| notified << o["orderId"] } # returns the queue: void keeps it off the wire
+    end.new
+    v = run_flow(spec, handlers, { "orderId" => "t-1", "qty" => 2 })
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "orderId" => "t-1", "qty" => 2, "status" => "VALIDATED" }, v.context)
     assert_equal "t-1", notified.pop
   end
 
   def test_retry_then_success_reports_the_attempt
-    name = unique("rb-it-retry")
-    flow = Wiggle.workflow(name) { step "flaky", retry: Retry.fixed(5, 0.1) }
-    w = new_worker("it-retry").handle(name, "flaky") do |_|
-      raise "blip" if Current.attempt < 2
+    spec = FlowSpec.define(unique("rb-it-retry"), 1) { |f| f.then_apply(:flaky, RetryPolicy.fixed(5, 0.1)) }
+    handlers = Class.new do
+      def flaky(_c)
+        raise "blip" if Wiggle::Step.attempt < 2
 
-      { "attempt" => Current.attempt, "step" => Current.step_name }
-    end
-    v = run_flow(flow, w, {}, timeout: 40)
+        { "attempt" => Wiggle::Step.attempt, "step" => Wiggle::Step.name }
+      end
+    end.new
+    v = run_flow(spec, handlers, {}, 40)
     assert_equal "COMPLETED", v.status, v.error
     assert_equal({ "attempt" => 2, "step" => "flaky" }, v.context)
   end
 
   def test_emitted_events_reach_the_feed_and_timings_feed_step_stats
-    name = unique("rb-it-events")
-    consumer = "#{name}-feed"
-    @client.poll_events(consumer, max_events: 1, wait: 0, start_from: -1) # register the cursor
-    flow = Wiggle.workflow(name) { step "ship" }
-    w = new_worker("it-events").handle(name, "ship") do |c|
-      Current.emit("order.shipped", { "attempt" => Current.attempt, "step" => Current.step_name })
-      c
-    end
-    v = run_flow(flow, w, { "id" => "o-1" })
+    spec = FlowSpec.define(unique("rb-it-events"), 1) { |f| f.then_apply(:ship) }
+    consumer = "#{spec.name}-feed"
+    @client.poll_events(consumer, 1, 0, -1) # register the cursor
+    handlers = Class.new do
+      def ship(c)
+        Wiggle::Step.emit("order.shipped", { "attempt" => Wiggle::Step.attempt, "step" => Wiggle::Step.name })
+        c
+      end
+    end.new
+    v = run_flow(spec, handlers, { "id" => "o-1" })
     assert_equal "COMPLETED", v.status, v.error
 
     seen = {}
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
     while seen.size < 3 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-      batch = @client.poll_events(consumer, max_events: 100, wait: 2)
-      batch.events.select { |e| e.instance_id == v.id }.each { |e| seen[e.type] = e }
-      @client.ack_events(consumer, cursor: batch.events.last.cursor) unless batch.events.empty?
+      events = @client.poll_events(consumer, 100, 2000, 0)
+      events.select { |e| e.instance_id == v.id }.each { |e| seen[e.type] = e }
+      @client.ack_events(consumer, events.last.cursor) unless events.empty?
     end
     assert_empty %w[wf.started order.shipped wf.completed] - seen.keys, seen.keys.inspect
     assert_equal({ "attempt" => 1, "step" => "ship" }, seen["order.shipped"].payload)
-    refute_empty seen["order.shipped"].node_id
-
-    assert_equal [["ship", 1]], @client.step_stats(name).nodes.map { |n| [n.name, n.count] }
+    refute_nil seen["order.shipped"].node_id
+    assert_equal [["ship", 1]], @client.step_stats(spec.name, nil, 0, 0).map { |n| [n.name, n.count] }
   end
 
   def test_queries
-    name = unique("rb-it-query")
-    flow = Wiggle.workflow(name) { step "a" }
-    v = run_flow(flow, new_worker("it-query").handle(name, "a") { |c| c }, { "k" => 1 })
-    assert_includes @client.workflow_names, name
-    assert_equal "a", @client.get_workflow(name)["nodes"].find { |n| n["kind"] == "TASK" }["name"]
-    assert_equal [v.id], @client.list_instances(workflow: name).map(&:id)
-    refute_empty @client.health["status"]
+    spec = FlowSpec.define(unique("rb-it-query"), 1) { |f| f.then_apply(:a) }
+    @client.register(spec)
+    worker = Worker.new(@client, "it-query", OPTIONS).register_handler(spec.name, Class.new { def a(c) = c }.new).start
+    begin
+      id = @client.start(spec, { "k" => 1 }, nil, "biz-#{spec.name}")
+      v = @client.await_completion(id, 30)
+    ensure
+      worker.close
+    end
+    assert_equal "COMPLETED", v.status, v.error
+    assert_includes @client.workflow_names, spec.name
+    assert_equal "a", @client.get_workflow(spec.name)["nodes"].find { |n| n["kind"] == "TASK" }["name"]
+    assert_equal [id], @client.list_instances(spec.name, nil, 10).map(&:id)
+    assert_equal [id], @client.find_by_correlation("biz-#{spec.name}").map(&:id)
+    refute_empty @client.instance_detail(id).tokens
+    assert_equal 404, assert_raises(WiggleApiException) { @client.get_workflow("#{spec.name}-missing") }.status
   end
 end

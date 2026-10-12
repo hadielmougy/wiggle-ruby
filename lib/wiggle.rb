@@ -1,15 +1,19 @@
 # frozen_string_literal: true
 
 require "logger"
+require "timeout"
 
-# Wiggle -- Ruby client and worker for the Wiggle workflow engine.
+# Wiggle -- Ruby client and worker for the Wiggle workflow engine, in the Java client's vocabulary.
 #
 #   require "wiggle"
 #
-# Describe a workflow's topology as declarative data (a Graph of nodes, or the Wiggle.workflow block
-# builder), compile and register it, start instances from the client, and implement its steps with a
-# worker that binds handlers by name. Talks the same gRPC control plane as the Java, Python and Go
-# clients, so their workers interoperate.
+#   order = Wiggle::FlowSpec.define("order-fulfilment", 1, OrderSteps) do |f, s|
+#     f.then_apply(s.validate).then_filter(s.in_stock?).then_accept(s.notify_customer)
+#   end
+#
+# Define a workflow as a chain on a WiggleFlow handle, register it with a WiggleClient, and serve
+# its steps from a Worker that binds handler objects by name. Talks the same gRPC control plane as
+# the Java, Python and Go clients, so their workers interoperate.
 module Wiggle
   class << self
     # The library's logger (WARN and above to stderr by default). Assign your own to integrate.
@@ -24,9 +28,11 @@ end
 require_relative "wiggle/version"
 require_relative "wiggle/errors"
 require_relative "wiggle/convert"
-require_relative "wiggle/current"
-require_relative "wiggle/workflow"
-require_relative "wiggle/dsl"
+require_relative "wiggle/retry_policy"
+require_relative "wiggle/activity"
+require_relative "wiggle/step"
+require_relative "wiggle/topology"
+require_relative "wiggle/flow"
 require_relative "wiggle/client"
 require_relative "wiggle/binder"
 require_relative "wiggle/worker"

@@ -2,10 +2,9 @@
 
 require_relative "test_helper"
 require "socket"
-require "stringio"
 
-# Client behaviour against a tiny in-process gRPC server (no real Wiggle server needed): the
-# cold-start wait, the API key header, and failure logging.
+# WiggleClient against a tiny in-process gRPC server (no real Wiggle server needed): the transient
+# retry, status mapping, and the API key header.
 class ClientTest < Minitest::Test
   include Wiggle
 
@@ -14,8 +13,10 @@ class ClientTest < Minitest::Test
 
     def register_workflow(req, call)
       @seen_metadata = call.metadata
-      Wiggle::PB::RegisterWorkflowResult.new(name: req.definition.fields["name"].string_value, version: "7", nodes: 1)
+      Wiggle::PB::RegisterWorkflowResult.new(name: req.definition.fields["name"].string_value, version: "1", nodes: 1)
     end
+
+    def get_workflow(req, _call) = raise(GRPC::NotFound, "no workflow #{req.name}")
   end
 
   def free_port
@@ -34,27 +35,27 @@ class ClientTest < Minitest::Test
     [server, thread, service]
   end
 
-  def flow = Graph.new("cold", [Step.new("a")]).compile
+  def flow = FlowSpec.define("cold", 1) { |f| f.then_apply(:a) }
 
-  # A worker-critical call issued before the server exists must WAIT for it and then succeed once it
-  # comes up -- rather than failing fast with UNAVAILABLE.
-  def test_cold_start_register_waits_for_server
+  # A call issued while the server is briefly unreachable is retried (UNAVAILABLE means the RPC never
+  # ran) and succeeds once the server comes up within the retry budget.
+  def test_unavailable_is_retried_until_the_server_is_up
     port = free_port
-    client = Client.new("127.0.0.1:#{port}") # wait_for_ready defaults to true
+    client = WiggleClient.new("127.0.0.1:#{port}")
     result = {}
     t = Thread.new do
-      result[:version] = client.register(flow)
+      client.register(flow)
+      result[:ok] = true
     rescue StandardError => e
       result[:error] = e
     end
-
-    Kernel.sleep 0.6
-    assert_empty result, "register returned before the server was up: #{result}"
+    Kernel.sleep 0.5
+    assert_empty result, "register gave up before the retry budget ran out: #{result}"
 
     server, thread, = serve(port)
     begin
       t.join(10)
-      assert_equal 7, result[:version], "register did not complete after the server came up: #{result}"
+      assert_equal({ ok: true }, result)
     ensure
       server.stop
       thread.join
@@ -62,42 +63,40 @@ class ClientTest < Minitest::Test
     end
   end
 
-  def test_query_calls_stay_fail_fast
-    client = Client.new("127.0.0.1:#{free_port}")
-    assert_raises(GRPC::Unavailable) { client.instance("nope") }
-    assert_raises(GRPC::Unavailable) { Client.new("127.0.0.1:#{free_port}", wait_for_ready: false).register(flow) }
+  def test_an_unreachable_server_is_status_0_once_retries_run_out
+    ENV["WIGGLE_RPC_MAX_ATTEMPTS"] = "1"
+    err = assert_raises(WiggleApiException) { WiggleClient.new("127.0.0.1:#{free_port}").instance("x") }
+    assert_equal 0, err.status
+    assert_kind_of GRPC::Unavailable, err.cause
+  ensure
+    ENV.delete("WIGGLE_RPC_MAX_ATTEMPTS")
+  end
+
+  def test_statuses_map_to_http_codes
+    port = free_port
+    server, thread, = serve(port)
+    begin
+      client = WiggleClient.new("127.0.0.1:#{port}")
+      err = assert_raises(WiggleApiException) { client.get_workflow("nope") }
+      assert_equal 404, err.status
+      assert err.client_error?
+      assert_match(/no workflow nope/, err.message)
+      assert_equal 500, assert_raises(WiggleApiException) { client.workflow_names }.status # unimplemented
+    ensure
+      server.stop
+      thread.join
+    end
   end
 
   def test_api_key_travels_as_a_bearer_token
     port = free_port
     server, thread, service = serve(port)
     begin
-      Client.open("http://127.0.0.1:#{port}", api_key: " s3cret ") { |c| c.register(flow) }
+      WiggleClient.new("http://127.0.0.1:#{port}", api_key: " s3cret ").register(flow)
       assert_equal "Bearer s3cret", service.seen_metadata["authorization"]
     ensure
       server.stop
       thread.join
     end
-  end
-
-  def test_failed_rpcs_are_logged
-    port = free_port
-    server, thread, = serve(port)
-    log = StringIO.new
-    begin
-      client = Client.new("127.0.0.1:#{port}", logger: Logger.new(log))
-      assert_raises(GRPC::Unimplemented) { client.get_workflow("nope") } # the fake doesn't implement it
-      assert_match(/rpc get_workflow failed: Unimplemented/, log.string)
-    ensure
-      server.stop
-      thread.join
-    end
-  end
-
-  def test_create_schedule_and_ack_events_validate_arguments
-    client = Client.new("127.0.0.1:1")
-    assert_raises(ArgumentError) { client.create_schedule("wf") }
-    assert_raises(ArgumentError) { client.create_schedule("wf", every: 1, cron: "* * * * *") }
-    assert_raises(ArgumentError) { client.ack_events("c") }
   end
 end

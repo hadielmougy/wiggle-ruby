@@ -2,194 +2,248 @@
 
 require_relative "test_helper"
 
-# Wiggle::Binder in isolation -- the binder is pure (graph in -> bindings out), so every signature
-# rule is testable with no server, no worker, no I/O. Mirrors the Java client's HandlerBinderTest.
+# Wiggle::HandlerBinder in isolation -- the binder is pure (graph in -> bindings out), so every
+# shape rule is testable with no server, no worker, no I/O. Mirrors the Java HandlerBinderTest.
 class BinderTest < Minitest::Test
   include Wiggle
 
   def handlers(&blk) = Class.new(&blk).new
 
+  def bind(target, graph, workflow = "wf") = HandlerBinder.bind(HandlerBinder.scan(workflow, target), graph)
+
+  def by_step(result) = result.bindings.to_h { |b| [b.activity, b] }
+
+  def linear
+    FlowSpec.define("wf", 1) { |f| f.then_apply(:work, "special").then_filter(:ok?).then_apply(:other) }.definition
+  end
+
   # ---------------------------------------------------------------- scan
+
+  def test_canonical_folds_case_styles
+    ["in-stock", "in_stock", "inStock", "InStock", "instock", "IN_STOCK", "in stock", "in_stock?"].each do |n|
+      assert_equal "instock", HandlerBinder.canonical(n), n
+    end
+    assert_equal "httpserver", HandlerBinder.canonical("HTTPServer")
+  end
 
   def test_scan_rejects_case_fold_collisions
     h = handlers do
       def in_stock(c) = c
-      def inStock(c) = c # rubocop:disable Naming/MethodName
+      def inStock(c) = c # rubocop:disable Naming/MethodName -- the collision is the point
     end
-    assert_match(/ambiguous/, assert_raises(ArgumentError) { Binder.scan(h) }.message)
+    assert_match(/ambiguous/, assert_raises(ArgumentError) { HandlerBinder.scan("wf", h) }.message)
   end
 
-  def test_scan_rejects_non_single_context_methods
-    h = handlers { def work(c, extra) = c }
-    assert_match(/single context argument/, assert_raises(ArgumentError) { Binder.scan(h) }.message)
-  end
-
-  def test_scan_rejects_an_object_with_no_handlers
-    h = handlers { private def helper = 1 }
-    assert_match(/no handler methods/, assert_raises(ArgumentError) { Binder.scan(h) }.message)
-  end
-
-  def test_scan_skips_private_helpers_setters_and_the_workflow_reader
+  def test_scan_skips_private_helpers_setters_and_keyword_only_methods
     h = handlers do
       attr_writer :config
 
-      def workflow = "wf"
       def work(c) = c
+      def configure(level:) = level
 
       private
 
       def helper(a, b, c) = nil
     end
-    assert_equal ["work"], Binder.scan(h).keys
+    assert_equal ["work"], HandlerBinder.scan("wf", h).by_name.keys
   end
 
-  def test_scan_accepts_optional_and_splat_parameters
-    h = handlers do
-      def a(c, opt = 1) = c
-      def b(*args) = args
-      def c(ctx, flag: false) = ctx
-    end
-    assert_equal %w[a b c], Binder.scan(h).keys.sort
+  def test_scan_rejects_an_object_with_no_handlers
+    assert_raises(ArgumentError) { HandlerBinder.scan("wf", handlers { private def helper = 1 }) }
   end
 
-  # ---------------------------------------------------------------- bind: kinds & wiring
-
-  def linear = Graph.new("wf", [Step.new("work", queue: "special"), Gate.new("ok"), Step.new("other")]).compile.definition
+  # ---------------------------------------------------------------- kinds & wiring
 
   def test_bind_kinds_queues_and_unserved
     h = handlers do
       def work(c) = c.merge("done" => true)
-      def ok?(c) = true
+      def ok?(c) = c["n"]
     end
-    result = Binder.bind("wf", Binder.scan(h), linear)
-    by_step = result.bindings.to_h { |b| [b.step, b] }
-    assert_equal %w[ok work], by_step.keys.sort
-    assert_equal "special", by_step["work"].queue # explicit queue respected
-    assert_equal "wf", by_step["ok"].queue        # default queue = the workflow name
+    result = bind(h, linear)
+    b = by_step(result)
+    assert_equal "special", b["wf#work"].queue # explicit queue respected
+    assert_equal "wf", b["wf#ok"].queue        # default queue = the workflow name
     assert_equal ["other"], result.unserved
-    assert_equal({ "a" => 1, "done" => true }, by_step["work"].handler.call({ "a" => 1 }))
-    assert_equal true, by_step["ok"].handler.call({})
+    assert_equal({ "a" => 1, "done" => true }, b["wf#work"].handler.call({ "a" => 1 }, nil))
+    assert_equal true, b["wf#ok"].handler.call({ "n" => 1 }, nil) # truthiness becomes a boolean
+    assert_equal false, b["wf#ok"].handler.call({}, nil)
   end
 
-  def test_bind_effect_returns_nil
-    h = Class.new(Wiggle::Handlers) do
-      effect def work(c)
-        c["seen"] = true
-      end
+  def test_void_methods_are_effects
+    h = Class.new do
+      extend Wiggle::ForFlow
+      void def work(c) = c.merge("seen" => true)
     end.new
-    handler = Binder.bind("wf", Binder.scan(h), linear).bindings.find { |b| b.step == "work" }.handler
-    assert_nil handler.call({ "a" => 1 }) # context untouched on the wire
+    assert_nil by_step(bind(h, linear))["wf#work"].handler.call({ "a" => 1 }, nil)
   end
 
-  def test_bind_rejects_kind_mismatches
-    assert_match(/did you mean a PREDICATE/,
-                 assert_raises(ArgumentError) { Binder.bind("wf", Binder.scan(handlers { def work?(c) = true }), linear) }.message)
-    effect_gate = Class.new(Wiggle::Handlers) { effect def ok(c) = c }.new
-    assert_match(/must return a boolean/,
-                 assert_raises(ArgumentError) { Binder.bind("wf", Binder.scan(effect_gate), linear) }.message)
+  def test_void_declared_on_an_included_contract
+    contract = Module.new do
+      extend Wiggle::ForFlow
+      void def work(c) = nil
+    end
+    h = Class.new do
+      include contract
+      def work(c) = true # a stray return value must not replace the context
+    end.new
+    assert_nil by_step(bind(h, linear))["wf#work"].handler.call({}, nil)
   end
 
-  def test_bind_rejects_a_handler_matching_no_step
-    h = handlers { def nonexistent(c) = c }
-    assert_match(/matches no step/, assert_raises(ArgumentError) { Binder.bind("wf", Binder.scan(h), linear) }.message)
+  def test_shape_mismatches_are_rejected
+    assert_match(/did you mean then_filter/,
+                 assert_raises(ArgumentError) { bind(handlers { def work?(c) = true }, linear) }.message)
+    void_gate = Class.new do
+      extend Wiggle::ForFlow
+      void def ok(c) = nil
+    end.new
+    assert_match(/gate .* is void/, assert_raises(ArgumentError) { bind(void_gate, linear) }.message)
+    assert_match(/must take 1 argument/, assert_raises(ArgumentError) { bind(handlers { def work(a, b) = a }, linear) }.message)
+    assert_match(/matches no step/, assert_raises(ArgumentError) { bind(handlers { def nope(c) = c }, linear) }.message)
+  end
+
+  def test_handles_renames_the_step_a_method_serves
+    h = Class.new do
+      extend Wiggle::ForFlow
+      handles "work", def do_work(c) = c.merge("x" => 1)
+    end.new
+    assert_equal({ "x" => 1 }, by_step(bind(h, linear))["wf#work"].handler.call({}, nil))
+  end
+
+  # ---------------------------------------------------------------- activity factories
+
+  class Doubler
+    include Wiggle::Activity
+    def execute(c) = c * 2
+  end
+
+  class Positive
+    include Wiggle::GateActivity
+    def test(c) = c.positive?
+  end
+
+  class Audit
+    include Wiggle::EffectActivity
+    attr_reader :seen
+
+    def apply(c) = (@seen = c)
+  end
+
+  def test_factories_serve_tasks_gates_and_effects
+    audit = Audit.new
+    h = handlers do
+      define_method(:work) { Doubler.new }
+      define_method(:ok) { Positive.new }
+      define_method(:other) { audit }
+    end
+    b = by_step(bind(h, linear))
+    assert_equal 6, b["wf#work"].handler.call(3, nil)
+    assert_equal true, b["wf#ok"].handler.call(3, nil)
+    assert_nil b["wf#other"].handler.call(9, nil)
+    assert_equal 9, audit.seen
+    assert_raises(ArgumentError) { bind(handlers { define_method(:ok) { Doubler.new } }, linear) }
+    assert_raises(ArgumentError) { bind(handlers { define_method(:work) { Object.new } }, linear) }
+  end
+
+  # ---------------------------------------------------------------- compensation
+
+  class Reserve
+    include Wiggle::CompensableActivity
+    attr_reader :undone
+
+    def execute(c) = c.merge("ref" => "r-1")
+    def compensate(comp) = (@undone = comp)
+  end
+
+  def saga = FlowSpec.define("saga", 1) { |f| f.then_apply_compensable(:reserve).then_apply(:charge, "payments") }.definition
+
+  def test_compensable_activity_binds_forward_and_undo
+    reserve = Reserve.new
+    h = handlers do
+      define_method(:reserve) { reserve }
+      define_method(:charge) { |c| c }
+    end
+    b = by_step(bind(h, saga, "saga"))
+    assert_equal({ "ref" => "r-1" }, b["saga#reserve"].handler.call({}, nil))
+    comp = b["saga#reserve#compensate"]
+    assert_equal "saga", comp.queue, "the undo is minted on the forward step's queue"
+    assert_nil comp.handler.call({ "input" => { "orderId" => "o1" }, "result" => { "ref" => "r-1" } }, nil)
+    assert_equal [{ "orderId" => "o1" }, { "ref" => "r-1" }], [reserve.undone.input, reserve.undone.result]
+  end
+
+  def test_compensable_step_needs_a_compensable_activity
+    h = handlers do
+      def reserve(c) = c
+      def charge(c) = c
+    end
+    assert_match(/CompensableActivity/, assert_raises(ArgumentError) { bind(h, saga, "saga") }.message)
+  end
+
+  def test_compensable_activity_on_a_plain_step_is_refused
+    h = handlers do
+      define_method(:reserve) { Reserve.new }
+      define_method(:charge) { Reserve.new } # charge is NOT compensable: its undo would never run
+    end
+    assert_match(/not declared compensable/, assert_raises(ArgumentError) { bind(h, saga, "saga") }.message)
   end
 
   # ---------------------------------------------------------------- combines
 
   def forked
-    Graph.new("wf", [Fork.new([Branch.new("a", [Step.new("a1")]), Branch.new("b", [Step.new("b1")])], combine: "merge")])
-         .compile.definition
+    FlowSpec.define("wf", 1) do |f|
+      Wiggle.all_of(f.then_apply(:charge), f.then_apply(:reserve)).combine(:settle)
+    end.definition
   end
 
-  def test_fork_combine_returns_verbatim
-    h = handlers do
-      def a1(c) = c
-      def b1(c) = c
-      def merge(c) = { "pre" => c["pre"] }.merge(c["a"], c["b"])
-    end
-    merge = Binder.bind("wf", Binder.scan(h), forked).bindings.find { |b| b.step == "merge" }.handler
-    assert_equal({ "pre" => "P", "x" => 1, "y" => 2 }, merge.call({ "pre" => "P", "a" => { "x" => 1 }, "b" => { "y" => 2 } }))
-  end
-
-  def test_combine_cannot_be_an_effect
-    h = Class.new(Wiggle::Handlers) do
-      def a1(c) = c
-      def b1(c) = c
-      effect def merge(c) = nil
-    end.new
-    assert_match(/complete post-join context/, assert_raises(ArgumentError) { Binder.bind("wf", Binder.scan(h), forked) }.message)
-  end
-
-  def test_legacy_items_key_is_still_a_combine
-    assert Binder.combine?({ "kind" => "TASK", "itemsKey" => '["a","b"]' })
-    assert Binder.combine?({ "kind" => "TASK", "armNames" => %w[a b] })
-    assert Binder.combine?({ "kind" => "TASK", "collectKey" => "__forEach__x" })
-    refute Binder.combine?({ "kind" => "TASK", "armNames" => [] })
-    refute Binder.combine?({ "kind" => "PREDICATE", "armNames" => ["a"] })
-  end
-
-  def test_unstage_presents_fork_arms_by_name
-    ctx, base = Binder.unstage({ "n" => 1, "__arm__l" => { "s" => "L" }, "__arm__r" => { "s" => "R" } }, %w[l r], "", "merge")
-    assert_equal({ "n" => 1, "l" => { "s" => "L" }, "r" => { "s" => "R" } }, ctx)
-    assert_equal({ "n" => 1 }, base)
-  end
-
-  def test_unstage_presents_for_each_results_by_name
-    ctx, base = Binder.unstage({ "items" => [1, 2], "__forEach__per-item" => %w[a b],
-                                 "__steps____forEach__per-item" => %w[norm norm] }, [], "__forEach__per-item", "collect")
-    assert_equal({ "items" => [1, 2], "per-item" => %w[a b] }, ctx)
-    assert_equal({ "items" => [1, 2] }, base)
-  end
-
-  def test_unstage_refuses_a_name_the_context_already_has
-    err = assert_raises(ArgumentError) { Binder.unstage({ "payment" => 1, "__arm__payment" => {} }, ["payment"], "", "merge") }
-    assert_match(/'payment' is both/, err.message)
-  end
-
-  def test_unstage_leaves_other_steps_alone
-    assert_equal [{ "__arm__x" => 1 }, nil], Binder.unstage({ "__arm__x" => 1 }, [], "", "s")
-  end
-
-  # ---------------------------------------------------------------- compensation pairing
-
-  def saga = Graph.new("saga", [Step.new("reserve", compensate: true), Step.new("charge", queue: "payments")]).compile.definition
-
-  def test_compensator_binds_and_splits_snapshots
-    seen = []
-    h = handlers do
-      define_method(:reserve) { |c| c }
-      define_method(:charge) { |c| c }
-      define_method(:compensate_reserve) { |comp| seen << comp }
-    end
-    comp = Binder.bind("saga", Binder.scan(h), saga).bindings.find { |b| b.activity == "saga#reserve#compensate" }
-    assert_equal "saga", comp.queue, "compensator inherits the forward step's queue"
-    out = comp.handler.call({ "input" => { "orderId" => "o1" }, "result" => { "orderId" => "o1", "reservationRef" => "r-9" } })
-    assert_nil out, "an undo never changes the instance context"
-    assert_equal({ "orderId" => "o1" }, seen.first.input)
-    assert_equal({ "orderId" => "o1", "reservationRef" => "r-9" }, seen.first.result)
-  end
-
-  def test_compensable_step_without_compensator_refuses_to_bind
-    h = handlers do
-      def reserve(c) = c
+  def test_fork_combine_takes_arms_in_order_and_an_optional_base
+    with_base = handlers do
       def charge(c) = c
-    end
-    assert_match(/compensate_reserve/, assert_raises(ArgumentError) { Binder.bind("saga", Binder.scan(h), saga) }.message)
-  end
-
-  def test_compensator_on_non_compensable_step_refuses_to_bind
-    h = handlers do
       def reserve(c) = c
-      def charge(c) = c
-      def compensate_reserve(comp) = nil
-      def compensate_charge(comp) = nil # charge is NOT compensable
+      def settle(payment, shipping, base) = base.merge(payment).merge(shipping)
     end
-    assert_match(/compensate_charge/, assert_raises(ArgumentError) { Binder.bind("saga", Binder.scan(h), saga) }.message)
+    settle = by_step(bind(with_base, forked))["wf#settle"].handler
+    assert_equal({ "n" => 1, "p" => 1, "s" => 2 }, settle.call([{ "p" => 1 }, { "s" => 2 }], { "n" => 1 }))
+
+    arms_only = handlers do
+      def charge(c) = c
+      def reserve(c) = c
+      def settle(payment, shipping) = payment.merge(shipping)
+    end
+    assert_equal({ "p" => 1, "s" => 2 }, by_step(bind(arms_only, forked))["wf#settle"].handler.call([{ "p" => 1 }, { "s" => 2 }], {}))
   end
 
-  def test_step_literally_named_compensate_x_stays_a_forward_handler
-    graph = Graph.new("wf", [Step.new("compensate-order")]).compile.definition
-    h = handlers { def compensate_order(c) = c.merge("handled" => true) }
-    assert_equal ["wf#compensate-order"], Binder.bind("wf", Binder.scan(h), graph).bindings.map(&:activity)
+  def test_combine_shape_is_checked
+    wrong = handlers do
+      def charge(c) = c
+      def reserve(c) = c
+      def settle(only) = only
+    end
+    assert_match(/must take 2 argument/, assert_raises(ArgumentError) { bind(wrong, forked) }.message)
+  end
+
+  def test_for_each_combine_takes_the_collected_results
+    graph = FlowSpec.define("wf", 1) { |f| f.then_for_each("items") { |i| i.then_apply(:price) }.combine(:total) }.definition
+    h = handlers do
+      def price(i) = i
+      def total(prices, base) = base.merge("total" => prices.sum)
+    end
+    total = by_step(bind(h, graph))["wf#total"].handler
+    assert_equal({ "k" => 1, "total" => 6 }, total.call([[1, 2, 3]], { "k" => 1 }))
+  end
+
+  def test_unstage_splits_staged_results_from_the_base
+    inputs, base = HandlerBinder.unstage({ "n" => 1, "__arm__l" => { "s" => "L" }, "__arm__r" => { "s" => "R" } }, %w[l r], "")
+    assert_equal [[{ "s" => "L" }, { "s" => "R" }], { "n" => 1 }], [inputs, base]
+    # a forEach named after its collection key: the results never collide with the collection itself
+    inputs, base = HandlerBinder.unstage({ "items" => [1], "__forEach__items" => ["a"], "__steps____forEach__items" => ["p"] },
+                                         [], "__forEach__items")
+    assert_equal [[["a"]], { "items" => [1] }], [inputs, base]
+    assert_equal [nil, nil], HandlerBinder.unstage({ "__arm__x" => 1 }, [], "")
+  end
+
+  def test_combine_nodes_are_recognised
+    assert HandlerBinder.combine?({ "kind" => "TASK", "armNames" => %w[a b] })
+    assert HandlerBinder.combine?({ "kind" => "TASK", "collectKey" => "__forEach__x" })
+    refute HandlerBinder.combine?({ "kind" => "TASK", "armNames" => [] })
+    refute HandlerBinder.combine?({ "kind" => "PREDICATE", "armNames" => ["a"] })
   end
 end

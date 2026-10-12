@@ -1,16 +1,14 @@
 # Wiggle — Ruby client
 
-An idiomatic Ruby client and worker for [Wiggle](https://github.com/hadielmougy/wiggle), the durable
-state-machine platform. It speaks the same gRPC control plane as the Java client, so **Ruby, Java,
-Python and Go workers interoperate** on the same server: define a flow in any of them, and any worker
-that registers the matching handlers can run its steps.
+A Ruby client and worker for [Wiggle](https://github.com/hadielmougy/wiggle), the durable
+state-machine platform, using the **Java client's vocabulary**: `FlowSpec.define`, a `WiggleFlow`
+chain of `then_apply` / `then_filter` / `then_accept`, `Wiggle.all_of(...).combine(...)`, a
+`WiggleClient`, and a `Worker` you `register_handler` on. It speaks the same gRPC control plane, so
+**Ruby, Java, Python and Go workers interoperate** on the same server: any worker that serves a
+step's name can run it.
 
-- **Control client**: register workflows, start and track instances, deliver signals, manage
-  schedules, and read the event feed, search, step statistics and backlog coverage.
-- **Worker**: implement steps by name. It pulls only the tasks it has capacity for, runs handlers,
-  and reports results, with automatic lease heartbeats and retries.
-- **Declarative topology**: describe a workflow as a `Graph` of nodes (`Step`/`Gate`/`Sleep`/`Fork`/…)
-  that mirror the graph schema, or with the equivalent `Wiggle.workflow` block builder.
+The names are the Java ones in Ruby's snake_case (`thenApply` → `then_apply`, `isRunning` →
+`running?`). Durations are seconds.
 
 ## Install
 
@@ -19,13 +17,7 @@ that registers the matching handlers can run its steps.
 gem "wiggle-client"
 ```
 
-```bash
-bundle install
-# or from a checkout:
-bundle install && bundle exec rake
-```
-
-Requires Ruby 3.1+ and a running Wiggle server. See the [engine repo](https://github.com/hadielmougy/wiggle)
+Requires Ruby 3.1+ and a running Wiggle server — see the [engine repo](https://github.com/hadielmougy/wiggle)
 (`docker run --rm -p 8080:8080 hadielmougy/wiggle`, or `./gradlew :dist:run` there).
 
 ## Quick start
@@ -33,32 +25,52 @@ Requires Ruby 3.1+ and a running Wiggle server. See the [engine repo](https://gi
 ```ruby
 require "wiggle"
 
-# 1. Describe the topology. It is pure data that mirrors the graph schema.
-wf = Wiggle.workflow("order") do
-  step "validate"
-  gate "in-stock"                                    # false -> ends as gated:in-stock
-  step "charge", queue: "payments", retry: Wiggle::Retry.exponential(5, 0.1)
-  sleep "cool-off", seconds: 1
-  effect "notify"
+# 1. The contract: the steps, by name (Java: an interface). Bodies are irrelevant.
+module OrderSteps
+  extend Wiggle::ForFlow
+
+  def validate(order) = nil
+  def in_stock?(order) = nil
+  def charge(order) = nil
+  def reserve(order) = nil
+  def settle(payment, shipping, order) = nil
+  void def notify_customer(order) = nil      # void: an effect, its return is ignored
 end
 
-# 2. Implement the steps by name. The context is a plain Hash; a step returns the whole new context.
-def bind(worker)
-  worker
-    .handle("order", "validate") { |o| o.merge("status" => "VALIDATED") }
-    .handle_gate("order", "in-stock") { |o| o["quantity"].positive? }
-    .handle("order", "charge") { |o| o.merge("paymentRef" => "auth-#{o['orderId']}") }
-    .handle_effect("order", "notify") { |o| puts "shipped #{o['orderId']}" }
+# 2. The topology, named through the contract's stand-in `s`. Nothing runs here.
+order = Wiggle::FlowSpec.define("order-fulfilment", 1, OrderSteps) do |f, s|
+  validated = f.then_apply(s.validate).then_filter(s.in_stock?)
+
+  payment  = validated.then_apply(s.charge, "payments", Wiggle::RetryPolicy.exponential(5, 0.1))
+  shipping = validated.then_apply(s.reserve).then_sleep(2)
+
+  Wiggle.all_of(payment, shipping).combine(s.settle).then_accept(s.notify_customer)
 end
 
-Wiggle::Client.open("localhost:8080") do |client|
-  client.register(wf)
-  bind(Wiggle::Worker.new(client, "worker-1")).start do       # background threads; stops after the block
-    id = client.start(wf, { "orderId" => "A-1", "quantity" => 3 })
-    view = client.await_completion(id, timeout: 30)
-    puts view.status, view.context                             # COMPLETED {...}
-  end
+# 3. The logic: a handler object that includes the same contract (Java: @ForFlow class).
+class OrderHandlers
+  extend Wiggle::ForFlow
+  include OrderSteps
+  for_flow "order-fulfilment"
+
+  def validate(order) = order.merge("status" => "VALIDATED")
+  def in_stock?(order) = order["quantity"].positive?
+  def charge(order) = { "paymentRef" => "auth-#{order['orderId']}" }
+  def reserve(order) = { "slot" => 7 }
+  def settle(payment, shipping, order) = order.merge(payment).merge(shipping)
+  def notify_customer(order) = puts("shipped #{order['orderId']}")
 end
+
+client = Wiggle::WiggleClient.new("localhost:8080")
+client.register(order)
+worker = Wiggle::Worker.new(client, "worker-1").register_handler(OrderHandlers.new).start
+
+id = client.start(order, { "orderId" => "A-1", "quantity" => 3 })
+view = client.await_completion(id, 30)
+puts view.status, view.context        # COMPLETED {...}
+
+worker.close
+client.close
 ```
 
 Run the bundled example against a server on `:8080`:
@@ -67,256 +79,220 @@ Run the bundled example against a server on `:8080`:
 ruby -Ilib examples/order.rb          # WIGGLE_URL=host:port to point elsewhere
 ```
 
-## Topology
+## Defining a flow
 
-A workflow's shape is declarative data: a `Wiggle::Graph.new(name, steps)` whose `steps` is an Array
-of node values that mirror the graph schema. `compile` validates the shape and returns a `FlowSpec`
-you register. Handlers are **not** part of the topology. A worker binds them separately, by name
-(see below).
+`FlowSpec.define(name, version, [default_retry], [contract]) { |f, s| … }` runs the block once and
+records a chain. The block must return the handle it ends on. The version is **declared, not
+derived**: a published version is immutable, so a changed graph needs a new number.
 
-| Node | Meaning |
+Steps are named by **reference**, never by running anything. With a contract module, `s.validate`
+names the step `validate`. Without one, the block takes only `f`, and you pass a method object
+(`handlers.method(:validate)`) or a Symbol (`:validate`). A trailing `?`/`!` is not part of the node
+name, so `s.in_stock?` names the step `in_stock`. Blocks and lambdas are refused: they have no
+handler method for a worker to bind.
+
+| `WiggleFlow` method | Records |
 |---|---|
-| `Step.new(name, queue:, retry:, compensate:)` | a task run on a worker (`handle`); its return replaces the context. `compensate: true` declares an undo that runs in the reverse pass if the instance later fails |
-| `Effect.new(name, queue:, retry:, compensate:)` | a side-effect step (`handle_effect`); context unchanged |
-| `Gate.new(name, queue:, retry:)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
-| `Fork.new([Branch.new(name, steps), …], combine:)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`). There is no implicit fold; needs ≥ 2 branches |
-| `ForEach.new(name, over:, body:, combine:)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over`. **The element IS the item's context**: body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `Wiggle::Current.base`. The mandatory `combine` handler receives every item's final value under `name` and returns the complete post-join context |
-| `Choose.new([Case.on(guard, steps), …, Case.otherwise(steps)])` | exclusive choice: the first case whose guard holds runs; `otherwise` (last) is the default |
-| `DoWhile.new(condition, body, max_iterations:)` | run `body`, then repeat while the `condition` predicate holds (body runs at least once; the loop is budgeted) |
-| `SubWorkflow.new(name, workflow)` | run another workflow (a `FlowSpec`, `Graph`, or name) as a child; its result merges back |
-| `Sleep.new(name, seconds:, millis:)` | server-side timer; no worker is held |
-| `AwaitSignal.new(name, timeout:, escalation:)` | wait for a signal via `client.signal(...)`; on timeout, fail, or run the `escalation` nodes and rejoin |
+| `then_apply(ref, [retry], [queue])` (alias `apply`) | a task: the handler's return becomes the new context |
+| `then_apply_compensable(ref, …)` (alias `apply_compensable`) | a task with an undo (served by a `CompensableActivity`) |
+| `then_accept(ref, …)` | an effect: the handler returns nothing, the context is unchanged |
+| `then_filter(ref, …)` | a guard: when it fails, the instance ends as `gated:<name>` (inside an arm: skips to the join) |
+| `then_sleep(seconds)` / `then_sleep(name, seconds)` | a server-side timer; no worker is held |
+| `then_await(signal, [timeout]) { \|esc\| … }` | wait for `client.signal(...)`; on timeout fail, or run the escalation block and rejoin |
+| `then_sub_flow(node, workflow)` | run another registered workflow as a child; its result merges back |
+| `then_for_each([name,] items_key) { \|item\| … }.combine(ref)` | runtime fan-out, one isolated branch per element of the collection at `items_key` |
+| `when(ref, …)` / `otherwise` + `Wiggle.one_of(*arms)` | exclusive choice: the first arm whose guard holds runs |
+| `repeat_while(ref, [max_iterations], [queue]) { \|body\| … }` | do-while loop; the body runs at least once and the loop is budgeted |
+| `default_queue(queue)` | the queue for every step recorded after this point |
 
-The block builder produces **exactly** the same definition (and version). The two forms are
-interchangeable:
+Every step takes an optional `RetryPolicy` and an optional queue (a String), in either order, as in
+Java. A step with no policy inherits the define's default (`RetryPolicy.forever`, 10,000 attempts).
+A step with no queue uses the current `default_queue`, else the workflow name. Retry policies are
+`RetryPolicy.exponential(attempts, initial_seconds)`, `RetryPolicy.fixed(attempts, seconds)`,
+`RetryPolicy.none` and `RetryPolicy.forever`.
+
+### Continuing a handle twice is a fan-out
+
+`validated` above is continued twice, and that is exactly what makes the two arms. Each arm runs on
+its **own isolated copy** of the context, so they must be rejoined:
+`Wiggle.all_of(payment, shipping).combine(s.settle)`. There is no implicit merge. A split that is
+never combined is rejected when the flow is defined:
+
+```
+in workflow 'order-fulfilment', the flow after 'validate' splits into ['charge', 'reserve'] but is never
+rejoined. Continuing one handle twice is a fan-out: pass both to Wiggle.all_of(...) and combine them, or
+continue only one of them.
+```
+
+An arm is named after its last step. The combine handler receives **one argument per arm, in the
+order given to `all_of`**, plus optionally a trailing argument for the pre-fork context. It returns
+the **complete** post-join context.
+
+Ruby control flow is unrolled: the block runs once, so a loop around `then_apply` records that many
+steps. Anything that depends on a step's *result* must be `Wiggle.one_of` or `repeat_while`, which
+the engine evaluates at run time:
 
 ```ruby
-include Wiggle
-
-wf = Graph.new("order", [
-  Step.new("validate"),
-  Fork.new([                                              # parallel, joined
-    Branch.new("payment",  [Step.new("charge")]),
-    Branch.new("shipping", [Step.new("reserve"), Step.new("label")]),
-  ], combine: "merge"),          # mandatory: branches rejoin at an explicit merge handler
-  Choose.new([                                            # exactly one arm runs
-    Case.on("vip", [Step.new("concierge")]),
-    Case.otherwise([Step.new("thanks")]),
-  ]),
-  Effect.new("notify"),
-]).compile
-
-wf = Wiggle.workflow("order") do
-  step "validate"
-  fork combine: "merge" do
-    branch("payment")  { step "charge" }
-    branch("shipping") { step "reserve"; step "label" }
-  end
-  choose do
-    on("vip") { step "concierge" }
-    otherwise { step "thanks" }
-  end
-  effect "notify"
+Wiggle::FlowSpec.define("routing", 1, Steps) do |f, s|
+  vip      = f.when(s.vip?).then_apply(s.concierge)
+  standard = f.otherwise.then_apply(s.thanks)
+  Wiggle.one_of(vip, standard).then_accept(s.notify)
 end
 ```
 
-Inside the builder, `for_each(name, over:, combine:) { … }`, `do_while(cond, max_iterations:) { … }`,
-`await_signal(name, timeout:) { escalation… }`, `sleep(name, seconds:)` and `sub_workflow(name, wf)`
-cover the remaining nodes. A block that takes a parameter is yielded the builder instead of being
-`instance_eval`'d, so the outer `self` stays reachable: `Wiggle.workflow("wf") { |f| f.step "a" }`.
-
-A fork's combine is bound with `handle_combine(workflow, step)`. It receives the context with each
-branch's result under the branch's name, and must return the **complete** post-join context. The
-engine replaces the context with it, so keys the handler omits do not survive the join (there is no
-implicit union of the arms):
+### forEach
 
 ```ruby
-worker.handle_combine("order", "merge") do |ctx|
-  ctx.except("payment", "shipping")       # carry the base
-     .merge(ctx["payment"] || {})         # fold what each arm produced
-     .merge(ctx["shipping"] || {})
+Wiggle::FlowSpec.define("pricing", 1, Steps) do |f, s|
+  f.then_for_each("items") { |item| item.then_apply(s.price) }.combine(s.total)
 end
-```
-
-`Wiggle::Current.base` returns that base (the pre-fork context) inside a combine too. If a branch name
-is also a key of the workflow's own context, the combine fails rather than guess.
-
-Runtime fan-out spawns one ISOLATED branch per element (list or map). The element IS each item's
-context: the handler receives the value itself, and its return replaces it:
-
-```ruby
-wf = Wiggle.workflow("charge") do
-  for_each("prices", over: "items", combine: "collect") { step "price" }
-  step "summarise"
-end
-# start(wf, { "items" => [1, 2, 3], "rate" => 2 }) -> one branch per item;
+# start(spec, { "items" => [1, 2, 3], "rate" => 2 }) -> one isolated branch per element;
 # an empty/missing collection skips the body AND the combine
-
-worker.handle("charge", "price") { |item| item * Wiggle::Current.base["rate"] }   # base is read-only
-worker.handle_combine("charge", "collect") do |ctx|
-  prices = ctx.delete("prices")   # every item's FINAL value: a list for a list input, a map for a map
-  ctx.merge("prices" => prices)   # the COMPLETE post-join context -- it replaces
-end
 ```
 
-Per-step `queue` defaults to `default_queue:` (a `Graph` / `Wiggle.workflow` option), else the
-workflow name. Retry policies (seconds): `Retry.exponential(attempts, initial)`,
-`Retry.fixed(attempts, backoff)`, `Retry.none`, `Retry.forever` (the default). Raise
-`Wiggle::PermanentError` from a handler to fail a step **without** retrying.
-
-A `SubWorkflow`'s child must be registered separately (`client.register(child)`), and some worker must
-serve the child's steps too. Because dispatch is by activity name (`"<workflow>#<step>"`), Ruby, Java,
-Python and Go workers interoperate: any can run another's steps.
-
-## Step metadata and events
-
-While a handler runs, `Wiggle::Current` describes the running step:
+**The element IS the item's context.** The body's handlers receive the element itself (scalars
+included), and their return replaces it. The combine receives every item's final value: an Array in
+item order, or a Hash keyed like the input when it was a map. It may also take the pre-forEach
+context, and it returns the complete post-join context:
 
 ```ruby
-worker.handle("order", "ship") do |ctx|
-  Wiggle::Current.attempt          # 1 on the first try, incremented on every retry
-  Wiggle::Current.step_name        # "ship"
-  Wiggle::Current.instance_id
-  Wiggle::Current.emit("order.shipped", { "orderId" => ctx["orderId"] })   # rides this step's report
-  ctx
-end
+def price(item) = item * Wiggle::Step.base["rate"]          # base: the frozen pre-forEach context
+def total(prices, order) = order.merge("total" => prices.sum)
 ```
 
-An emitted event is committed only if the attempt completes; a failed attempt leaves nothing behind.
-Read the feed with `client.poll_events(consumer)` / `client.ack_events(consumer, cursor:)`. Inside a
-forEach item step, `Current.base`, `Current.item_index` and `Current.item_map_key` describe the item.
+## Serving steps: handler objects
 
-## Compensation (sagas)
+A worker binds a handler object's public methods to steps **by name, regardless of case style**:
+`in_stock?`, `in_stock`, `inStock` and a Java-authored `in-stock` are the same step. The graph
+decides whether a step is a task or a gate. The method's shape decides the rest:
 
-A step declared `compensate: true` is undone when the instance later fails. The engine runs the
-step's **compensator** in the reverse pass (newest-completed first) as a real durable task, and hands
-it a `Wiggle::Compensation` holding the step's **input/result context snapshots** captured at
-completion. These are not the instance's latest context, which a later step may have replaced. The
-instance settles `COMPENSATED` (or `COMPENSATION_FAILED` if an undo exhausts its retries).
-
-```ruby
-worker.handle("order", "reserve") { |o| reserve(o) }
-worker.handle_compensation("order", "reserve") { |c| release_reservation(c.result["reservationRef"]) }  # idempotent!
-```
-
-On a handlers object, the compensator is a method named `compensate_<step>` that takes the
-`Compensation` (`compensate_reserve` undoes `reserve`). The pairing is checked both ways at start: a
-compensable step served without its compensator, or a compensator targeting a non-compensable step,
-refuses to bind. Compensators are at-least-once like every handler, so make them idempotent.
-
-## Binding handlers by name (polyglot)
-
-You don't have to author a workflow in Ruby to implement one of its steps in Ruby. If any client
-(Java, Go, Python or Ruby) has already registered the graph, bind handlers **by name** without
-re-declaring the topology:
-
-```ruby
-# implement just `charge` on a flow whose topology was authored elsewhere (e.g. in Java)
-Wiggle::Worker.new(client, "payments")
-  .handle("order-fulfilment", "charge") { |o| o.merge("paymentRef" => "auth-#{o['orderId']}") }
-  .start
-```
-
-| Method | Binds a… |
+| Method | Serves |
 |---|---|
-| `handle(workflow, step) { \|ctx\| … }` | task: returns the new context (it replaces; `nil` leaves it untouched) |
-| `handle_gate(workflow, step) { \|ctx\| … }` | predicate (a gate / choose guard / do-while condition); truthiness picks the branch |
-| `handle_effect(workflow, step) { \|ctx\| … }` | side effect: runs, and the context is unchanged |
-| `handle_combine(workflow, step) { \|ctx\| … }` | a fork/forEach combine: returns the complete post-join context |
-| `handle_compensation(workflow, step) { \|comp\| … }` | the undo of a compensable step |
+| `def validate(order)` | a task: the return **replaces** the context (`nil` leaves it untouched) |
+| `def in_stock?(order)` on a gate node | a guard: its truthiness picks the branch |
+| `void def notify(order)` | an effect: runs, and the return is ignored |
+| `def settle(arm1, arm2, [base])` on a combine node | the merge: one argument per arm (or the forEach results), optionally the base |
+| `def authorise` (no arguments) | a **factory** returning a `Wiggle::Activity` (`execute`), `GateActivity` (`test`), `EffectActivity` (`apply`) or `CompensableActivity` (`execute` + `compensate`) |
 
-Each also accepts a callable instead of a block: `handle("wf", "s", method(:charge))`.
-
-On `start` the worker **reconciles** every binding against the registered graph. It checks that each
-step exists and is the right kind, so a typo or a task bound as a gate fails fast and lists the real
-step names. It also **discovers which queue each step polls**, so a name-only worker needs no queue
-config. The graph must be registered *before* the worker starts. Pass `await_registration: 30` to
-ride out a startup race instead of failing fast. See
-[`examples/polyglot_worker.rb`](examples/polyglot_worker.rb) for a Java-authored flow served from Ruby.
-
-### A whole object of handlers: `register_handlers`
-
-Instead of one `handle` call per step, hand the worker an object whose public methods *are* the steps:
+`void` and `handles` come from `extend Wiggle::ForFlow`, Ruby's rendering of Java's `void` and
+`@Handles`. `void` can sit on the contract module that the handler includes.
+`handles "capture-payment", def do_capture(o) … end` serves a step whose name differs from the
+method's. `for_flow "name"` (Java's `@ForFlow`) names the workflow the object serves.
 
 ```ruby
-class OrderHandlers < Wiggle::Handlers
-  workflow "order-fulfilment"             # or pass workflow: to register_handlers
-
-  def validate(o) = o.merge("status" => "VALIDATED")      # a task: returns the new context
-
-  def in_stock?(o) = o["qty"].positive?                    # matches the gate named "in-stock"
-
-  effect def notify(o)                                     # a side effect: context unchanged
-    puts "shipped #{o['orderId']}"
-  end
-
-  private
-
-  def receipt(o) = ...                                     # private: a helper, not a step handler
-end
-
-Wiggle::Worker.new(client, "orders").register_handlers(OrderHandlers.new).start
+worker.register_handler(OrderHandlers.new)                    # workflow from `for_flow`
+worker.register_handler("order-fulfilment", PlainObject.new)  # or named here
+worker.register_handler(OrderHandlersV3.new, 3)               # this version only
 ```
 
-Each public method is matched to a step **by name, regardless of case style**: `inStock`, `in_stock`,
-`in_stock?` and a graph step named `in-stock` all fold to the same key. The graph is the source of
-truth for the exact step name and for gate-vs-task, and a handler that contradicts it fails fast:
-`effect` on a gate, or a `?`-named method on a task. Mark side effects with `effect` (it takes method
-names, or wraps a `def`), or pass `effects: [:notify]` to `register_handlers` for a plain object. Two
-methods whose names collide under case-folding are rejected at `register_handlers` time (ambiguous). A
-method that matches no step is caught on `start`.
+On `start`, each registration is checked against the registered graph. A method that matches no
+step, or whose shape clashes with its node, fails fast. The worker also learns which queue each step
+polls, so it needs no queue config. A version-scoped registration is checked against that exact
+graph, and the worker claims only that version's tasks. If *any* registration is unversioned, the
+worker claims every version.
 
-## Client API
+### Compensation (sagas)
+
+A step declared with `then_apply_compensable` is undone if the instance later fails. The handler
+serves it with a factory returning a `CompensableActivity`. The engine runs `compensate` in the
+reverse pass, handing it a `Wiggle::Compensation` with the step's `input` and `result` snapshots. The
+instance settles `COMPENSATED` (or `COMPENSATION_FAILED`).
 
 ```ruby
-client = Wiggle::Client.new("localhost:8080")          # or Wiggle::Client.open(target) { |c| … }
-client.register(flow_spec, force: false)               # -> version
-client.get_workflow(name, version: nil)                # -> Hash: the registered graph
+class Authorise
+  include Wiggle::CompensableActivity
+  def execute(order) = gateway.charge(order)
+  def compensate(c) = gateway.refund(c.result["reference"])   # idempotent: at-least-once
+end
+
+class OrderHandlers
+  # ...
+  def authorise = Authorise.new
+end
+```
+
+### Step metadata and events
+
+While a handler runs, `Wiggle::Step` describes it:
+
+```ruby
+def ship(order)
+  Wiggle::Step.attempt        # 1 on the first try, incremented on every retry
+  Wiggle::Step.name           # "ship"
+  Wiggle::Step.instance_id
+  Wiggle::Step.emit("order.shipped", { "orderId" => order["orderId"] })   # rides this step's report
+  order
+end
+```
+
+An emitted event is committed only if the attempt completes. `Step.base` is the frozen base context
+inside a forEach item step or a combine, and `Step.item_index` / `Step.item_map_key` describe a
+forEach element. Raise `Wiggle::PermanentActivityException` to fail a step without retrying.
+
+## WiggleClient
+
+```ruby
+client = Wiggle::WiggleClient.new("localhost:8080", tls: nil, api_key: ENV["WIGGLE_API_KEY"])
+client.register(flow_spec, force = false)
+client.get_workflow(name, version = nil)          # -> Hash: the registered graph
 client.workflow_names
-client.start(flow_spec_or_name, context, version: nil, correlation_id: nil)   # -> instance id
-client.instance(id)                                    # -> InstanceView (#status #context #termination_reason #error #done?)
-client.await_completion(id, timeout: 30)               # -> InstanceView, or raises Wiggle::TimeoutError
-client.list_instances(workflow: nil, status: nil, correlation_id: nil, limit: 100)
-client.cancel(id, reason: "cancelled")
-client.signal(id, name, payload = nil)
-client.create_schedule(workflow, every: 60 | cron: "*/5 * * * *", context: nil)
-client.list_schedules / client.delete_schedule(id)
-client.poll_events(consumer, max_events: 100, wait: 10, start_from: 0) / client.ack_events(consumer, cursor:)
-client.search(text, workflow: nil, status: nil, semantic: false, …)
-client.step_stats(workflow) / client.backlog_coverage
-client.health / client.cluster
+client.start(flow_spec_or_name, context, version = nil, correlation_id = nil)   # -> instance id
+client.instance(id)                               # -> InstanceView (#status #context #termination_reason #error #terminal?)
+client.instance_detail(id)                        # -> InstanceWithTokens
+client.await_completion(id, timeout)              # -> InstanceView, or raises Timeout::Error
+client.list_instances(workflow, status, limit)
+client.find_by_correlation(correlation_id, limit = 50)
+client.cancel(id, reason)
+client.signal(id, signal, payload)
+client.create_schedule(workflow, every_seconds, context) / client.create_cron_schedule(workflow, cron, context)
+client.schedules / client.delete_schedule(id)
+client.poll_events(consumer, max, wait_millis, start_from) / client.ack_events(consumer, cursor_or_seq)
+client.search(text, workflow, status, updated_from, updated_to, limit, partial_ok, semantic = false)
+client.step_stats(workflow, version, since, sample) / client.backlog_coverage(max)
+client.cluster
 client.close
 ```
 
-Connection options: `credentials:` (a `GRPC::Core::ChannelCredentials` for TLS/mTLS) or `tls: true`
-(system trust roots). `api_key:` defaults to `ENV["WIGGLE_API_KEY"]` and is sent as
-`authorization: Bearer <key>`, like the Java client. `wait_for_ready:` (default `true`) makes the
-worker-critical RPCs (register, get_workflow, poll, report, fail, heartbeat) wait for an unreachable
-server instead of failing, so a worker rides out a cold start or a rolling restart. Query calls stay
-fail-fast. RPC failures surface as `GRPC::BadStatus` subclasses (`GRPC::NotFound`, …).
+Every failure raises `Wiggle::WiggleApiException` with an HTTP-style `status`: 400 invalid, 401
+unauthenticated, 403 forbidden, 404 not found, 409 conflict/precondition, 0 server unreachable, 500
+otherwise. A call that finds the server UNAVAILABLE is retried first, `WIGGLE_RPC_MAX_ATTEMPTS`
+times (default 5) with exponential backoff from `WIGGLE_RPC_RETRY_DELAY_MILLIS` (default 200).
+`tls:` takes a `GRPC::Core::ChannelCredentials` (TLS/mTLS), or `true` for the system roots. The API
+key is sent as `authorization: Bearer <key>`.
 
-The worker takes `concurrency:` (default: CPU count), `lease:`, `long_poll_wait:`, `queues:` (overrides
-discovery) and `await_registration:`, all in seconds. `start` runs it on background threads.
-`start { … }` runs the block and then drains. `run_forever` blocks until SIGINT/SIGTERM. Log output
-goes to `Wiggle.logger`, which you can replace with your own `Logger`.
-
-## Versioning
-
-By default a workflow's version is a **content hash of its structure**: node kinds, names, activities,
-queues, retries and the edge topology. It does not depend on internal node-id numbering. So the same
-structure always yields the same version: re-registering is idempotent, the server de-duplicates,
-and changing the graph mints a new version (in-flight instances keep running on the old one). The
-hash is byte-compatible with the Python client's, so the same topology declared in Ruby or Python
-registers as the same version.
-
-Pin an explicit version when you want a stable, human-meaningful one:
+## Worker
 
 ```ruby
-wf = Wiggle.workflow("order", version: 3) { step "validate" }
+options = Wiggle::WorkerOptions.defaults
+  .with_concurrency(8)              # in-flight handlers (default: CPU count)
+  .with_lease(30)                   # seconds; renewed by heartbeat while a handler runs
+  .with_long_poll_wait(10)
+  .with_queues("payments")          # override the queues learned from the graph
+  .with_await_registration(30)      # ride out a startup race with the authoring service
+worker = Wiggle::Worker.new(client, "worker-1", options)
+worker.register_handler(OrderHandlers.new).start
+worker.running? / worker.in_flight
+worker.close                        # stop polling and drain claimed tasks
 ```
 
-With an explicit version **you** own bumping it when the graph changes. The server overwrites the
-stored graph for a reused `name:version`, which affects instances already running on it.
+Log output goes to `Wiggle.logger`; replace it with your own `Logger`.
+
+## Java → Ruby names
+
+| Java | Ruby |
+|---|---|
+| `FlowSpec.define("o", 1, Order.class, OrderSteps.class, (f, s) -> …)` | `Wiggle::FlowSpec.define("o", 1, OrderSteps) { \|f, s\| … }` |
+| `f.thenApply(s::validate)` | `f.then_apply(s.validate)` |
+| `thenFilter` / `thenAccept` / `thenApplyCompensable` | `then_filter` / `then_accept` / `then_apply_compensable` |
+| `thenSleep(Duration.ofSeconds(2))` | `then_sleep(2)` |
+| `thenAwait` / `thenSubFlow` / `thenForEach` / `repeatWhile` | `then_await` / `then_sub_flow` / `then_for_each` / `repeat_while` |
+| `Wiggle.allOf(a, b).combine(s::settle)` / `Wiggle.oneOf(...)` | `Wiggle.all_of(a, b).combine(s.settle)` / `Wiggle.one_of(...)` |
+| `interface OrderSteps` / `@ForFlow` / `@Handles` / `void` | contract `module` / `for_flow` / `handles` / `void` |
+| `Activity` / `GateActivity` / `EffectActivity` / `CompensableActivity` | same names, as mixins (`execute` / `test` / `apply` / `compensate`) |
+| `new WiggleClient(target)` / `awaitCompletion(id, Duration)` | `WiggleClient.new(target)` / `await_completion(id, seconds)` |
+| `worker.registerHandler(h)` / `isRunning()` / `close()` | `register_handler(h)` / `running?` / `close` |
+| `Step.attempt()` / `Step.emit(...)` / `Step.base()` | `Wiggle::Step.attempt` / `.emit(...)` / `.base` |
+| `PermanentActivityException` / `WiggleApiException` | same names |
 
 ## Tests
 
@@ -328,11 +304,11 @@ WIGGLE_TEST_URL=localhost:8080 bundle exec rake          # + end-to-end tests ag
 
 ## Notes & limits
 
-- **Execution mode:** Ruby-defined workflows run in `SERVER` mode. The worker does not implement the
-  `LOCAL_SYNC`/`LOCAL_ASYNC` (client-side chaining) protocol; serve those with a Java worker. Run-time
-  branches (`Step.create`) and queue criteria are not ported yet.
+- **Not ported:** run-time branches (`Step.create` and the combine that follows a creating step),
+  queue criteria and attributes, the `LOCAL_SYNC`/`LOCAL_ASYNC` execution modes (and `checkpoint`),
+  `@Decode`, and typed contexts. A Ruby context is a plain Hash (or, inside a forEach body, the
+  element itself). Ruby-defined workflows run in `SERVER` mode.
 - **Numbers:** context travels as protobuf `Value` (doubles). Whole numbers come back as `Integer`,
-  and fractional values as `Float`. Hash keys come back as Strings (Symbol keys and values are
-  accepted on the way out).
+  and fractional values as `Float`. Hash keys come back as Strings.
 - **Regenerating stubs:** `gem install grpc-tools && ./codegen.sh` after syncing `proto/wiggle.proto`
   with the engine's copy.

@@ -6,7 +6,7 @@ Gem::Specification.new do |spec|
   spec.name = "wiggle-client"
   spec.version = Wiggle::VERSION
   spec.authors = ["Hadi Elmougy"]
-  spec.summary = "Ruby client and worker for the Wiggle workflow engine"
+  spec.summary = "Ruby client and worker for the Wiggle workflow engine, in the Java client's vocabulary"
   spec.description = "Describe Wiggle workflows as declarative graphs, register and start them, and run " \
                      "their steps on Ruby workers that interoperate with Java, Python and Go workers."
   spec.homepage = "https://github.com/hadielmougy/wiggle-ruby"
